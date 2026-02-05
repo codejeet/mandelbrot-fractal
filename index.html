@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Mandelbrot Fractal Explorer</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { width: 100%; height: 100%; overflow: hidden; background: #000; }
+canvas { display: block; width: 100vw; height: 100vh; touch-action: none; }
+#hud {
+  position: fixed; top: 12px; left: 12px;
+  color: #fff; font: 13px/1.5 monospace;
+  background: rgba(0,0,0,0.6); padding: 8px 12px;
+  border-radius: 4px; pointer-events: none;
+  text-shadow: 0 1px 2px rgba(0,0,0,0.8);
+  white-space: pre;
+}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud"></div>
+<script>
+"use strict";
+
+const canvas = document.getElementById("c");
+const hud = document.getElementById("hud");
+const gl = canvas.getContext("webgl", { antialias: false, preserveDrawingBuffer: false });
+
+if (!gl) {
+  document.body.innerHTML = '<p style="color:#fff;padding:2em">WebGL not supported.</p>';
+  throw new Error("No WebGL");
+}
+
+// --- State ---
+let centerX = -0.5, centerY = 0.0;
+let zoom = 1.0;          // 1.0 = full view (-2..1 x -1.5..1.5)
+let colorOffset = 0.0;   // animated color cycling
+let maxIter = 200;       // adaptive
+const BASE_ITER = 200;
+
+// Drag state
+let dragging = false;
+let dragStartX = 0, dragStartY = 0;
+let dragCenterX = 0, dragCenterY = 0;
+
+// Touch state
+let touches = {};
+let pinchDist0 = 0;
+let pinchCenter0 = [0, 0];
+let pinchZoom0 = 1;
+let pinchCX0 = 0, pinchCY0 = 0;
+
+// --- Shaders ---
+const VERT_SRC = `
+attribute vec2 a_pos;
+void main() { gl_Position = vec4(a_pos, 0.0, 1.0); }
+`;
+
+const FRAG_SRC = `
+precision highp float;
+uniform vec2 u_resolution;
+uniform vec2 u_center;
+uniform float u_zoom;
+uniform float u_colorOffset;
+uniform int u_maxIter;
+
+vec3 palette(float t) {
+  // Smooth gradient: 6-color cycling
+  t = fract(t);
+  float r = 0.5 + 0.5 * cos(6.28318 * (t + 0.0));
+  float g = 0.5 + 0.5 * cos(6.28318 * (t + 0.33));
+  float b = 0.5 + 0.5 * cos(6.28318 * (t + 0.67));
+  return vec3(r, g, b);
+}
+
+void main() {
+  vec2 uv = (gl_FragCoord.xy - u_resolution * 0.5) / min(u_resolution.x, u_resolution.y);
+  float scale = 3.0 / u_zoom;
+  vec2 c = u_center + uv * scale;
+
+  float x = 0.0, y = 0.0;
+  float x2 = 0.0, y2 = 0.0;
+  int iter = 0;
+
+  for (int i = 0; i < 10000; i++) {
+    if (i >= u_maxIter) break;
+    if (x2 + y2 > 4.0) break;
+    y = 2.0 * x * y + c.y;
+    x = x2 - y2 + c.x;
+    x2 = x * x;
+    y2 = y * y;
+    iter = i + 1;
+  }
+
+  if (iter >= u_maxIter) {
+    gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);
+  } else {
+    // Smooth iteration count
+    float sn = float(iter) - log2(log2(x2 + y2)) + 4.0;
+    float t = sn / 80.0 + u_colorOffset;
+    gl_FragColor = vec4(palette(t), 1.0);
+  }
+}
+`;
+
+function compileShader(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    console.error(gl.getShaderInfoLog(s));
+    gl.deleteShader(s);
+    return null;
+  }
+  return s;
+}
+
+const vs = compileShader(gl.VERTEX_SHADER, VERT_SRC);
+const fs = compileShader(gl.FRAGMENT_SHADER, FRAG_SRC);
+const prog = gl.createProgram();
+gl.attachShader(prog, vs);
+gl.attachShader(prog, fs);
+gl.linkProgram(prog);
+if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+  console.error(gl.getProgramInfoLog(prog));
+}
+gl.useProgram(prog);
+
+// Full-screen quad
+const buf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
+const aPos = gl.getAttribLocation(prog, "a_pos");
+gl.enableVertexAttribArray(aPos);
+gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+
+// Uniforms
+const uRes = gl.getUniformLocation(prog, "u_resolution");
+const uCenter = gl.getUniformLocation(prog, "u_center");
+const uZoom = gl.getUniformLocation(prog, "u_zoom");
+const uColorOffset = gl.getUniformLocation(prog, "u_colorOffset");
+const uMaxIter = gl.getUniformLocation(prog, "u_maxIter");
+
+// --- Resize ---
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = window.innerWidth * dpr;
+  canvas.height = window.innerHeight * dpr;
+  gl.viewport(0, 0, canvas.width, canvas.height);
+}
+window.addEventListener("resize", resize);
+resize();
+
+// --- Coordinate helpers ---
+function screenToFractal(sx, sy) {
+  const dpr = window.devicePixelRatio || 1;
+  const px = sx * dpr;
+  const py = (window.innerHeight - sy) * dpr; // flip Y
+  const w = canvas.width, h = canvas.height;
+  const minDim = Math.min(w, h);
+  const scale = 3.0 / zoom;
+  const fx = centerX + (px - w * 0.5) / minDim * scale;
+  const fy = centerY + (py - h * 0.5) / minDim * scale;
+  return [fx, fy];
+}
+
+// --- Adaptive iterations ---
+function updateMaxIter() {
+  maxIter = Math.min(10000, Math.floor(BASE_ITER + 100 * Math.log2(zoom + 1)));
+}
+
+// --- Mouse: Zoom toward cursor ---
+canvas.addEventListener("wheel", function(e) {
+  e.preventDefault();
+  const [fx, fy] = screenToFractal(e.clientX, e.clientY);
+  const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+  // Zoom toward cursor: shift center
+  centerX = fx + (centerX - fx) / factor;
+  centerY = fy + (centerY - fy) / factor;
+  zoom *= factor;
+  updateMaxIter();
+}, { passive: false });
+
+// --- Mouse: Click-drag panning ---
+canvas.addEventListener("mousedown", function(e) {
+  if (e.button !== 0) return;
+  dragging = true;
+  dragStartX = e.clientX;
+  dragStartY = e.clientY;
+  dragCenterX = centerX;
+  dragCenterY = centerY;
+  canvas.style.cursor = "grabbing";
+});
+
+window.addEventListener("mousemove", function(e) {
+  if (!dragging) return;
+  const dpr = window.devicePixelRatio || 1;
+  const minDim = Math.min(canvas.width, canvas.height);
+  const scale = 3.0 / zoom;
+  const dx = (e.clientX - dragStartX) * dpr / minDim * scale;
+  const dy = (e.clientY - dragStartY) * dpr / minDim * scale;
+  centerX = dragCenterX - dx;
+  centerY = dragCenterY + dy; // flip Y
+});
+
+window.addEventListener("mouseup", function() {
+  dragging = false;
+  canvas.style.cursor = "default";
+});
+
+// --- Touch: Pinch zoom + drag ---
+function getTouchDist(t1, t2) {
+  const dx = t1.clientX - t2.clientX;
+  const dy = t1.clientY - t2.clientY;
+  return Math.sqrt(dx * dx + dy * dy);
+}
+
+canvas.addEventListener("touchstart", function(e) {
+  e.preventDefault();
+  for (const t of e.changedTouches) touches[t.identifier] = t;
+  const ids = Object.keys(touches);
+  if (ids.length === 1) {
+    const t = touches[ids[0]];
+    dragging = true;
+    dragStartX = t.clientX;
+    dragStartY = t.clientY;
+    dragCenterX = centerX;
+    dragCenterY = centerY;
+  } else if (ids.length >= 2) {
+    dragging = false;
+    const t1 = touches[ids[0]], t2 = touches[ids[1]];
+    pinchDist0 = getTouchDist(t1, t2);
+    pinchCenter0 = [(t1.clientX + t2.clientX) / 2, (t1.clientY + t2.clientY) / 2];
+    pinchZoom0 = zoom;
+    pinchCX0 = centerX;
+    pinchCY0 = centerY;
+  }
+}, { passive: false });
+
+canvas.addEventListener("touchmove", function(e) {
+  e.preventDefault();
+  for (const t of e.changedTouches) touches[t.identifier] = t;
+  const ids = Object.keys(touches);
+  if (ids.length === 1 && dragging) {
+    const t = touches[ids[0]];
+    const dpr = window.devicePixelRatio || 1;
+    const minDim = Math.min(canvas.width, canvas.height);
+    const scale = 3.0 / zoom;
+    const dx = (t.clientX - dragStartX) * dpr / minDim * scale;
+    const dy = (t.clientY - dragStartY) * dpr / minDim * scale;
+    centerX = dragCenterX - dx;
+    centerY = dragCenterY + dy;
+  } else if (ids.length >= 2) {
+    const t1 = touches[ids[0]], t2 = touches[ids[1]];
+    const dist = getTouchDist(t1, t2);
+    const factor = dist / pinchDist0;
+    const [fx, fy] = screenToFractal(pinchCenter0[0], pinchCenter0[1]);
+    zoom = pinchZoom0 * factor;
+    centerX = fx + (pinchCX0 - fx) / factor;
+    centerY = fy + (pinchCY0 - fy) / factor;
+    updateMaxIter();
+  }
+}, { passive: false });
+
+canvas.addEventListener("touchend", function(e) {
+  for (const t of e.changedTouches) delete touches[t.identifier];
+  if (Object.keys(touches).length === 0) dragging = false;
+});
+
+canvas.addEventListener("touchcancel", function(e) {
+  for (const t of e.changedTouches) delete touches[t.identifier];
+  if (Object.keys(touches).length === 0) dragging = false;
+});
+
+// --- Keyboard: R to reset ---
+window.addEventListener("keydown", function(e) {
+  if (e.key === "r" || e.key === "R") {
+    centerX = -0.5;
+    centerY = 0.0;
+    zoom = 1.0;
+    updateMaxIter();
+  }
+});
+
+// --- Render loop ---
+function render(time) {
+  colorOffset = time * 0.00005; // slow color cycling
+
+  gl.uniform2f(uRes, canvas.width, canvas.height);
+  gl.uniform2f(uCenter, centerX, centerY);
+  gl.uniform1f(uZoom, zoom);
+  gl.uniform1f(uColorOffset, colorOffset);
+  gl.uniform1i(uMaxIter, maxIter);
+
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+  // HUD
+  hud.textContent =
+    "Center: " + centerX.toFixed(12) + " + " + centerY.toFixed(12) + "i\n" +
+    "Zoom:   " + zoom.toExponential(3) + "\n" +
+    "Iter:   " + maxIter + "\n" +
+    "R: Reset view | Scroll: Zoom | Drag: Pan";
+
+  requestAnimationFrame(render);
+}
+
+updateMaxIter();
+requestAnimationFrame(render);
+</script>
+</body>
+</html>
